@@ -1,0 +1,36 @@
+[Unit]
+Description=Onboard Environment Container (RT)
+=======
+# 在 Docker 服务和 eth0 网口出现后运行
+After=docker.service sys-subsystem-net-devices-eth0.device
+Requires=docker.service
+Wants=sys-subsystem-net-devices-eth0.device
+
+[Service]
+User=root
+Type=oneshot
+RemainAfterExit=yes
+
+# ======= 只放行 RT 权限，不主动进入 RT =======
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+Nice=-20
+
+# ==============================================
+ExecStartPre=/bin/bash -c "while ! ip link show eth0 > /dev/null 2>&1; do sleep 1; done; sleep 30"
+
+ExecStart=/home/unitree/ioenv_cli/bin/onboard_env start
+
+ExecStartPost=/usr/bin/docker exec onboard_env /bin/bash -lc "\
+  ulimit -r 99 && \
+  ulimit -l unlimited && \
+  source /opt/ros/humble/setup.bash && \
+  source /opt/io_ws/install/setup.bash && \
+  exec ros2 launch humanoid_controller real.launch.py \
+    network_interface:=eth0 \
+    policy_path:=/opt/onnx_policy/unitree/g1/whole_body_tracking/2026-01-08_04-15-08_g1_train_charleston.onnx > /root/workspace/ros2_launch_$(date +%%Y-%%m-%%d_%%H-%%M-%%S).log 2>&1 "
+
+ExecStop=/home/unitree/ioenv_cli/bin/onboard_env stop
+
+[Install]
+WantedBy=multi-user.target

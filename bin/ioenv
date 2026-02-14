@@ -1,0 +1,597 @@
+#!/bin/bash
+#
+# IOEnv CLI - Unified environment management script
+# Usage: ioenv <command> <environment> [args...]
+#        ioenv list
+#
+
+set -e
+
+# ============================================================================
+# Path and Version Setup
+# ============================================================================
+
+WS_DIR=$(cd "$(dirname "$0")/.."; pwd)
+GIT_VER=$(git -C "$WS_DIR" rev-parse --short HEAD 2>/dev/null)$([[ -z $(git -C "$WS_DIR" status --porcelain 2>/dev/null) ]] && echo "" || echo "-dirty")
+SSH_PORT=${SSH_PORT:-2222}
+
+# ============================================================================
+# Logging Functions
+# ============================================================================
+
+log_info() {
+    echo -e "\033[32m[INFO]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[31m[ERROR]\033[0m $1"
+}
+
+log_warn() {
+    echo -e "\033[33m[WARN]\033[0m $1"
+}
+
+assert() {
+    if [ $? -ne 0 ]; then
+        log_error "$2, code $1"
+        exit "$1"
+    fi
+}
+
+# ============================================================================
+# Environment Listing
+# ============================================================================
+
+list_env_status() {
+    echo ""
+    printf "%-20s %-10s %-12s %-10s\n" "ENVIRONMENT" "IMAGE" "CONTAINER" "STATUS"
+    printf "%-20s %-10s %-12s %-10s\n" "-----------" "-----" "---------" "------"
+
+    for f in "$WS_DIR"/env.d/*.env; do
+        if [ -f "$f" ]; then
+            local name
+            name=$(basename "$f" .env)
+
+            # Source the env file to get IMAGE_NAME and CONTAINER_NAME
+            (
+                source "$f"
+
+                # Check if image exists
+                local image_status="--        "
+                if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+                    image_status="\033[32myes\033[0m       "
+                fi
+
+                # Check container status
+                local container_status="--          "
+                local running_status="--        "
+                if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+                    container_status="\033[32myes\033[0m         "
+                    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+                        running_status="\033[32mrunning\033[0m   "
+                    else
+                        running_status="\033[33mstopped\033[0m   "
+                    fi
+                fi
+
+                printf "%-20s " "$name"
+                printf "%b " "$image_status"
+                printf "%b " "$container_status"
+                printf "%b\n" "$running_status"
+            )
+        fi
+    done
+    echo ""
+}
+
+show_usage() {
+    log_info "Usage: ioenv <command> <environment>"
+    log_info "       ioenv list"
+    log_info "       ioenv create <name> --from <existing>"
+    log_info "       ioenv create <name> --image <docker_image>"
+    log_info ""
+    log_info "Available environments:"
+    for f in "$WS_DIR"/env.d/*.env; do
+        if [ -f "$f" ]; then
+            echo "  - $(basename "$f" .env)"
+        fi
+    done
+    log_info ""
+    log_info "Run 'ioenv list' to see environment status"
+    log_info "Run 'ioenv help <environment>' for available commands"
+}
+
+# ============================================================================
+# Environment Creation
+# ============================================================================
+
+create_environment_from_existing() {
+    local new_name="$1"
+    local from_name="$2"
+
+    # Validate new environment name (alphanumeric + underscore only)
+    if [[ ! "$new_name" =~ ^[a-zA-Z][a-zA-Z0-9_]*$ ]]; then
+        log_error "Invalid environment name: '$new_name'"
+        log_info "Name must start with a letter and contain only letters, numbers, and underscores"
+        exit 1
+    fi
+
+    # Check if new environment already exists
+    if [ -f "$WS_DIR/env.d/${new_name}.env" ]; then
+        log_error "Environment '$new_name' already exists"
+        exit 1
+    fi
+
+    # Check if source environment exists
+    if [ ! -f "$WS_DIR/env.d/${from_name}.env" ]; then
+        log_error "Source environment '$from_name' not found"
+        exit 1
+    fi
+
+    # Create new .env file with substitutions
+    log_info "Creating env.d/${new_name}.env"
+    sed -e "s/${from_name}/${new_name}/g" \
+        "$WS_DIR/env.d/${from_name}.env" > "$WS_DIR/env.d/${new_name}.env"
+
+    log_info "Environment '$new_name' created successfully!"
+    log_info ""
+    log_info "Next steps:"
+    log_info "  1. Edit env.d/${new_name}.env to customize settings"
+    log_info "  2. Run 'ioenv pull ${new_name}' to fetch the image"
+    log_info ""
+    log_info "Or run directly with the base image:"
+    log_info "  ioenv run ${new_name}"
+}
+
+create_environment_from_image() {
+    local new_name="$1"
+    local image_tag="$2"
+
+    # Validate new environment name (alphanumeric + underscore only)
+    if [[ ! "$new_name" =~ ^[a-zA-Z][a-zA-Z0-9_]*$ ]]; then
+        log_error "Invalid environment name: '$new_name'"
+        log_info "Name must start with a letter and contain only letters, numbers, and underscores"
+        exit 1
+    fi
+
+    # Check if new environment already exists
+    if [ -f "$WS_DIR/env.d/${new_name}.env" ]; then
+        log_error "Environment '$new_name' already exists"
+        exit 1
+    fi
+
+    # Create new .env file
+    log_info "Creating env.d/${new_name}.env"
+    cat > "$WS_DIR/env.d/${new_name}.env" << EOF
+# ${new_name} environment
+# Created from image: ${image_tag}
+
+IMAGE_NAME="${image_tag}"
+CONTAINER_NAME="${new_name}_env"
+DATA_VOLUME_NAME="${new_name}_home"
+MEDIA_VOLUME_NAME="${new_name}_media"
+HOST_WORKSPACE="${new_name}_ws"
+
+# Feature flags
+ENABLE_X11=true
+ENABLE_SSH=false
+ENABLE_START_CMD=false
+
+# Docker run arguments
+CUSTOM_RUN_ARGS=(
+    "--gpus" "all"
+    "-e" "NVIDIA_VISIBLE_DEVICES=all"
+    "-e" "NVIDIA_DRIVER_CAPABILITIES=all"
+    "-e" "DISPLAY=\$DISPLAY"
+    "-e" "QT_X11_NO_MITSHM=1"
+    "-v" "/tmp/.X11-unix:/tmp/.X11-unix"
+    "-v" "\$HOME/ioenv_ws/\$HOST_WORKSPACE:/root/workspace:rw"
+)
+EOF
+
+    log_info "Environment '$new_name' created successfully!"
+    log_info ""
+    log_info "Next steps:"
+    log_info "  1. Edit env.d/${new_name}.env to customize settings"
+    log_info "  2. Run 'ioenv pull ${new_name}' to fetch the image"
+    log_info ""
+    log_info "Or run directly with the base image:"
+    log_info "  ioenv run ${new_name}"
+}
+
+# ============================================================================
+# Environment Resolution
+# ============================================================================
+
+resolve_environment() {
+    COMMAND="$1"
+    ENV_NAME="$2"
+
+    shift 2 2>/dev/null || true
+    EXTRA_ARGS=("$@")
+
+    # Validate command
+    if [ -z "$COMMAND" ]; then
+        show_usage
+        exit 1
+    fi
+
+    # Handle 'list' as a special global command
+    if [ "$COMMAND" = "list" ]; then
+        list_env_status
+        exit 0
+    fi
+
+    # Handle 'help' without environment as global command
+    if [ "$COMMAND" = "help" ] && [ -z "$ENV_NAME" ]; then
+        show_usage
+        exit 0
+    fi
+
+    # Handle 'create' as a special global command
+    if [ "$COMMAND" = "create" ]; then
+        local new_name="$ENV_NAME"
+        local flag="${EXTRA_ARGS[0]}"
+        local value="${EXTRA_ARGS[1]}"
+
+        if [ -z "$new_name" ]; then
+            log_error "Usage: ioenv create <name> --from <existing>"
+            log_info "       ioenv create <name> --image <docker_image>"
+            exit 1
+        fi
+
+        case "$flag" in
+            --from)
+                if [ -z "$value" ]; then
+                    log_error "Missing environment name after --from"
+                    exit 1
+                fi
+                create_environment_from_existing "$new_name" "$value"
+                ;;
+            --image)
+                if [ -z "$value" ]; then
+                    log_error "Missing image tag after --image"
+                    exit 1
+                fi
+                create_environment_from_image "$new_name" "$value"
+                ;;
+            *)
+                log_error "Usage: ioenv create <name> --from <existing>"
+                log_info "       ioenv create <name> --image <docker_image>"
+                log_info ""
+                log_info "Examples:"
+                log_info "  ioenv create myenv --from isaaclab"
+                log_info "  ioenv create myenv --image ubuntu:22.04"
+                exit 1
+                ;;
+        esac
+        exit 0
+    fi
+
+    # Load environment definition
+    ENV_FILE="$WS_DIR/env.d/${ENV_NAME}.env"
+    if [ ! -f "$ENV_FILE" ]; then
+        log_error "Environment '$ENV_NAME' not found"
+        log_info "Available environments:"
+        for f in "$WS_DIR"/env.d/*.env; do
+            if [ -f "$f" ]; then
+                echo "  - $(basename "$f" .env)"
+            fi
+        done
+        exit 1
+    fi
+
+    # Source environment configuration
+    source "$ENV_FILE"
+
+}
+
+# ============================================================================
+# Display
+# ============================================================================
+
+platform_check() {
+    echo -e "\e[33m"
+    echo -e "██╗ ██████╗     ███████╗███╗   ██╗██╗   ██╗"
+    echo -e "██║██╔═══██╗    ██╔════╝████╗  ██║██║   ██║"
+    echo -e "██║██║   ██║    █████╗  ██╔██╗ ██║██║   ██║"
+    echo -e "██║██║   ██║    ██╔══╝  ██║╚██╗██║╚██╗ ██╔╝"
+    echo -e "██║╚██████╔╝    ███████╗██║ ╚████║ ╚████╔╝ "
+    echo -e "╚═╝ ╚═════╝     ╚══════╝╚═╝  ╚═══╝  ╚═══╝  "
+    echo -e "\e[0m"
+    log_info "Environment: $ENV_NAME"
+    log_info "Workspace: $HOME/ioenv_ws/$HOST_WORKSPACE"
+    log_info "Git Version: $GIT_VER"
+    log_info "Image: $IMAGE_NAME"
+}
+
+# ============================================================================
+# Docker Pull
+# ============================================================================
+
+docker_pull() {
+    log_info "Pulling image from DockerHub: $IMAGE_NAME"
+    docker pull "$IMAGE_NAME"
+    assert $? "Failed to pull image"
+    log_info "Image pulled successfully"
+}
+
+# ============================================================================
+# Docker Volume Management
+# ============================================================================
+
+ensure_volumes() {
+    # Create data volume
+    if ! docker volume ls -q | grep -q "^${DATA_VOLUME_NAME}$"; then
+        log_info "Creating data volume $DATA_VOLUME_NAME"
+        docker volume create "$DATA_VOLUME_NAME" >/dev/null
+        assert $? "Failed to create data volume $DATA_VOLUME_NAME"
+    else
+        log_info "Using existing data volume $DATA_VOLUME_NAME"
+    fi
+
+    # Create media volume
+    if ! docker volume ls -q | grep -q "^${MEDIA_VOLUME_NAME}$"; then
+        log_info "Creating media volume $MEDIA_VOLUME_NAME"
+        docker volume create "$MEDIA_VOLUME_NAME" >/dev/null
+        assert $? "Failed to create media volume $MEDIA_VOLUME_NAME"
+    else
+        log_info "Using existing media volume $MEDIA_VOLUME_NAME"
+    fi
+}
+
+# ============================================================================
+# Docker Container Management
+# ============================================================================
+
+docker_create() {
+    # Check if image exists, if not pull it
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        log_info "Image not found locally, pulling..."
+        docker_pull
+    fi
+
+    # Ensure volumes exist
+    ensure_volumes
+
+    # Create container
+    log_info "Creating container $CONTAINER_NAME"
+
+    # Enable X11 forwarding if needed
+    if [ "$ENABLE_X11" = "true" ]; then
+        xhost + >/dev/null 2>&1
+        assert $? "Failed to enable X11 forwarding"
+    fi
+
+    # Build docker run command
+    docker run \
+        --name="$CONTAINER_NAME" \
+        --interactive \
+        --detach \
+        --network=host \
+        --volume="$DATA_VOLUME_NAME:/root" \
+        --volume="$MEDIA_VOLUME_NAME:/media" \
+        "${CUSTOM_RUN_ARGS[@]}" \
+        "$IMAGE_NAME"
+
+    assert $? "Failed to create container $CONTAINER_NAME"
+}
+
+docker_start() {
+    # Try create container if not exists
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        log_info "Container $CONTAINER_NAME not found, creating..."
+        docker_create
+        return
+    fi
+
+    # Try start container if not running
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        log_info "Container $CONTAINER_NAME is not running, starting..."
+        docker start "$CONTAINER_NAME" >/dev/null
+        assert $? "Failed to start container $CONTAINER_NAME"
+    else
+        log_info "Container $CONTAINER_NAME is already running"
+    fi
+}
+
+docker_run() {
+    local was_created=false
+    local was_started=false
+
+    # Check if container exists
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        log_info "Container $CONTAINER_NAME not found, creating..."
+        docker_create
+        was_created=true
+    fi
+
+    # Check if container is running
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        log_info "Container $CONTAINER_NAME is not running, starting..."
+        docker start "$CONTAINER_NAME" >/dev/null
+        assert $? "Failed to start container $CONTAINER_NAME"
+        was_started=true
+    fi
+
+    # Run firstboot check if container was just created or started
+    if [ "$was_created" = "true" ] || [ "$was_started" = "true" ]; then
+        docker exec -it "$CONTAINER_NAME" echo >/dev/null 2>&1
+        assert $? "Failed to run package check on firstboot"
+    fi
+
+    # Enable X11 forwarding if needed
+    if [ "$ENABLE_X11" = "true" ]; then
+        xhost + >/dev/null 2>&1
+        assert $? "Failed to enable X11 forwarding"
+    fi
+
+    # Enter terminal
+    docker exec -it "$CONTAINER_NAME" /bin/bash
+}
+
+docker_stop() {
+    log_info "Stopping container $CONTAINER_NAME"
+    docker stop "$CONTAINER_NAME" >/dev/null
+    assert $? "Failed to stop container $CONTAINER_NAME"
+}
+
+docker_remove() {
+    # Try stop container if running
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        docker_stop
+    fi
+
+    # Remove container
+    log_info "Removing container $CONTAINER_NAME"
+    docker rm "$CONTAINER_NAME" >/dev/null
+    assert $? "Failed to remove container $CONTAINER_NAME"
+}
+
+docker_remove_volume() {
+    if whiptail --title "WARNING" --yesno "This will remove all data in /root and /media" 10 60; then
+        docker volume rm "$DATA_VOLUME_NAME" >/dev/null 2>&1
+        docker volume rm "$MEDIA_VOLUME_NAME" >/dev/null 2>&1
+        assert $? "Failed to remove volumes"
+        log_info "Volumes removed"
+    else
+        log_info "Volume removal cancelled"
+    fi
+}
+
+# ============================================================================
+# SSH Functions
+# ============================================================================
+
+docker_ssh_open() {
+    if [ "$ENABLE_SSH" != "true" ]; then
+        log_error "SSH is not enabled for this environment"
+        exit 1
+    fi
+
+    log_info "Opening SSH port on $SSH_PORT"
+
+    # Ensure SSH is installed
+    docker exec "$CONTAINER_NAME" bash -c "which sshd >/dev/null 2>&1 || (apt-get update && apt-get install -y openssh-server tmux && mkdir -p /var/run/sshd)" >/dev/null 2>&1
+
+    # Configure SSH port
+    docker exec "$CONTAINER_NAME" bash -c "
+        [ -f /etc/ssh/sshd_config ] || touch /etc/ssh/sshd_config
+        sed -i '/^#Port/d; /^Port/d' /etc/ssh/sshd_config
+        echo \"Port $SSH_PORT\" >> /etc/ssh/sshd_config
+        grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+        sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+        sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    "
+    assert $? "Failed to configure SSH"
+
+    # Start SSH service
+    docker exec "$CONTAINER_NAME" service ssh start
+    assert $? "Failed to start SSH service"
+    log_info "SSH port opened on port $SSH_PORT"
+    log_info "You can connect using: ssh root@<host-ip> -p $SSH_PORT"
+}
+
+docker_ssh_password() {
+    if [ "$ENABLE_SSH" != "true" ]; then
+        log_error "SSH is not enabled for this environment"
+        exit 1
+    fi
+
+    docker exec -it "$CONTAINER_NAME" passwd root
+    assert $? "Failed to add SSH password"
+    log_info "SSH password added"
+}
+
+# ============================================================================
+# Help
+# ============================================================================
+
+show_help() {
+    log_info "Commands for '$ENV_NAME' environment:"
+    log_info ""
+    log_info "  run               - Create/start container and enter bash"
+    if [ "$ENABLE_START_CMD" = "true" ]; then
+        log_info "  start             - Start container (non-interactive)"
+    fi
+    log_info "  stop              - Stop the container"
+    log_info "  restart           - Stop and start the container"
+    log_info "  remove            - Remove the container"
+    log_info "  purge             - Remove the data and media volumes"
+    log_info "  pull              - Pull image from DockerHub"
+    if [ "$ENABLE_SSH" = "true" ]; then
+        log_info "  sshopen           - Open SSH port (default: 2222, set SSH_PORT to change)"
+        log_info "  sshpassword       - Add SSH password to the container"
+    fi
+    log_info "  help              - Show this help"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    # Resolve environment from args
+    resolve_environment "$@"
+
+    # Clear screen if running in terminal
+    if [ -t 1 ]; then
+        clear 2>/dev/null || true
+    fi
+    platform_check
+
+    case "$COMMAND" in
+        run)
+            docker_run
+            ;;
+        start)
+            if [ "$ENABLE_START_CMD" = "true" ]; then
+                docker_start
+            else
+                log_error "Command 'start' is not available for this environment"
+                log_info "Use 'run' to start and enter the container"
+                exit 1
+            fi
+            ;;
+        stop)
+            docker_stop
+            ;;
+        restart)
+            docker_stop
+            if [ "$ENABLE_START_CMD" = "true" ]; then
+                docker_start
+            else
+                docker_run
+            fi
+            ;;
+        remove)
+            docker_remove
+            ;;
+        purge)
+            docker_remove_volume
+            ;;
+        pull)
+            docker_pull
+            ;;
+        sshopen)
+            if [ "$ENABLE_START_CMD" = "true" ]; then
+                docker_start
+            fi
+            docker_ssh_open
+            ;;
+        sshpassword)
+            docker_ssh_password
+            ;;
+        help|"")
+            show_help
+            ;;
+        *)
+            log_error "Unknown command: $COMMAND"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
