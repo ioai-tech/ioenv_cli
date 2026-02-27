@@ -4,11 +4,25 @@ A minimal CLI to run prebuilt DockerHub images for robotics development environm
 
 ## Quick Start
 
+For a detailed setup and usage tutorial, see [this page](https://io-ai.tech/iocreed/en/docs/locomotion_00/).
+
 ### Prerequisites
 
 - Docker installed and running
 - NVIDIA Container Toolkit (for GPU support)
 - X11 display server (for GUI applications)
+
+### Install Dependencies
+
+**Install Docker** — [Tutorial](https://docs.docker.com/engine/install/)
+
+> [!TIP]
+> You need to add your user to the `docker` group.
+```bash
+sudo usermod -aG docker $USER  # Reboot required after running this
+```
+
+**Install NVIDIA Container Toolkit** — [Tutorial](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
 ### Install
 
@@ -103,6 +117,17 @@ SSH_PORT=3333 ioenv sshopen onboard
 ioenv sshpassword onboard
 ssh root@<host-ip> -p 3333
 ```
+
+### SSH X11 Forwarding (Remote)
+
+Connect with X11 forwarding enabled, then run as usual:
+
+```bash
+ssh -X user@host   # or -Y for trusted forwarding
+ioenv run isaaclab
+```
+
+The CLI detects the forwarded `DISPLAY` and `XAUTHORITY` automatically on each `ioenv run`.
 
 ## Notes
 

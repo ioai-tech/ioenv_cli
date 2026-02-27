@@ -359,8 +359,9 @@ docker_create() {
 
     # Enable X11 forwarding if needed
     if [ "$ENABLE_X11" = "true" ]; then
-        xhost + >/dev/null 2>&1
-        assert $? "Failed to enable X11 forwarding"
+        if ! xhost + >/dev/null 2>&1; then
+            log_warn "X11 forwarding unavailable (DISPLAY='$DISPLAY'), GUI apps may not work"
+        fi
     fi
 
     # Build docker run command
@@ -422,12 +423,27 @@ docker_run() {
 
     # Enable X11 forwarding if needed
     if [ "$ENABLE_X11" = "true" ]; then
-        xhost + >/dev/null 2>&1
-        assert $? "Failed to enable X11 forwarding"
+        if ! xhost + >/dev/null 2>&1; then
+            log_warn "X11 forwarding unavailable (DISPLAY='$DISPLAY'), GUI apps may not work"
+        fi
     fi
 
-    # Enter terminal
-    docker exec -it "$CONTAINER_NAME" /bin/bash
+    # Enter terminal, injecting current DISPLAY and XAUTHORITY so X11
+    # works even if the container was created in a different SSH session.
+    local exec_args=(-it)
+    if [ -n "$DISPLAY" ]; then
+        exec_args+=(-e "DISPLAY=$DISPLAY")
+    fi
+    # Copy the current xauth file into the container on every exec so that
+    # SSH-session temp files (e.g. /tmp/xauth-xxx) work correctly.
+    if [ "$ENABLE_X11" = "true" ]; then
+        local xauth_src="${XAUTHORITY:-$HOME/.Xauthority}"
+        if [ -f "$xauth_src" ]; then
+            docker cp "$xauth_src" "$CONTAINER_NAME:/tmp/.Xauthority_session" 2>/dev/null || true
+            exec_args+=(-e "XAUTHORITY=/tmp/.Xauthority_session")
+        fi
+    fi
+    docker exec "${exec_args[@]}" "$CONTAINER_NAME" /bin/bash
 }
 
 docker_stop() {
@@ -449,14 +465,55 @@ docker_remove() {
 }
 
 docker_remove_volume() {
-    if whiptail --title "WARNING" --yesno "This will remove all data in /root and /media" 10 60; then
-        docker volume rm "$DATA_VOLUME_NAME" >/dev/null 2>&1
-        docker volume rm "$MEDIA_VOLUME_NAME" >/dev/null 2>&1
-        assert $? "Failed to remove volumes"
-        log_info "Volumes removed"
-    else
-        log_info "Volume removal cancelled"
+    # Collect what currently exists
+    local has_container=false
+    local has_data_vol=false
+    local has_media_vol=false
+
+    docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"  && has_container=true
+    docker volume ls -q | grep -q "^${DATA_VOLUME_NAME}$"               && has_data_vol=true
+    docker volume ls -q | grep -q "^${MEDIA_VOLUME_NAME}$"              && has_media_vol=true
+
+    if [ "$has_container" = false ] && [ "$has_data_vol" = false ] && [ "$has_media_vol" = false ]; then
+        log_info "Nothing to purge for environment '$ENV_NAME'"
+        return
     fi
+
+    # Show what will be deleted
+    log_warn "The following will be permanently deleted:"
+    [ "$has_container" = true ] && echo "  - Container : $CONTAINER_NAME"
+    [ "$has_data_vol" = true ]  && echo "  - Volume    : $DATA_VOLUME_NAME  (/root — history, configs, packages)"
+    [ "$has_media_vol" = true ] && echo "  - Volume    : $MEDIA_VOLUME_NAME (/media)"
+    echo ""
+
+    # Require explicit confirmation
+    read -rp "Type 'yes' to confirm: " confirm
+    if [ "$confirm" != "yes" ]; then
+        log_info "Purge cancelled"
+        return
+    fi
+
+    # Must remove container first — volumes in use cannot be deleted
+    if [ "$has_container" = true ]; then
+        if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            log_info "Stopping container $CONTAINER_NAME..."
+            docker stop "$CONTAINER_NAME" >/dev/null
+        fi
+        log_info "Removing container $CONTAINER_NAME..."
+        docker rm "$CONTAINER_NAME" >/dev/null
+    fi
+
+    # Now remove volumes
+    if [ "$has_data_vol" = true ]; then
+        log_info "Removing volume $DATA_VOLUME_NAME..."
+        docker volume rm "$DATA_VOLUME_NAME" >/dev/null
+    fi
+    if [ "$has_media_vol" = true ]; then
+        log_info "Removing volume $MEDIA_VOLUME_NAME..."
+        docker volume rm "$MEDIA_VOLUME_NAME" >/dev/null
+    fi
+
+    log_info "Purge complete — next 'run' will start fresh"
 }
 
 # ============================================================================
