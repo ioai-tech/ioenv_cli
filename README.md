@@ -37,8 +37,9 @@ source ioenv.sh
 ```bash
 ioenv list
 ioenv help
-ioenv run isaaclab
 ioenv pull isaaclab
+ioenv pull isaaclab --from-mirror  # for users in China
+ioenv run isaaclab
 ```
 
 ### Create a New Environment
@@ -76,6 +77,7 @@ ioenv run myenv
 | `remove` | Remove container (keeps volumes) |
 | `purge` | Remove data volumes (destructive) |
 | `pull` | Pull image from DockerHub |
+| `pull --from-mirror` | Pull image via mirror server (for users in China) |
 | `sshopen` | Open SSH port (if enabled) |
 | `sshpassword` | Add SSH password (if enabled) |
 | `help` | Show available commands |

@@ -310,10 +310,33 @@ platform_check() {
 # ============================================================================
 
 docker_pull() {
-    log_info "Pulling image from DockerHub: $IMAGE_NAME"
-    docker pull "$IMAGE_NAME"
-    assert $? "Failed to pull image"
-    log_info "Image pulled successfully"
+    local use_mirror=false
+    for arg in "$@"; do
+        [ "$arg" = "--from-mirror" ] && use_mirror=true
+    done
+
+    if [ "$use_mirror" = "true" ]; then
+        local mirrors_file="$WS_DIR/conf.d/mirrors.env"
+        if [ ! -f "$mirrors_file" ]; then
+            log_error "Mirror config not found: $mirrors_file"
+            exit 1
+        fi
+        source "$mirrors_file"
+        local mirror_image="${MIRROR_REGISTRY}/${IMAGE_NAME}"
+        log_info "Pulling image via mirror: $mirror_image"
+        docker pull "$mirror_image"
+        assert $? "Failed to pull image from mirror"
+        log_info "Tagging $mirror_image -> $IMAGE_NAME"
+        docker tag "$mirror_image" "$IMAGE_NAME"
+        assert $? "Failed to tag image"
+        docker rmi "$mirror_image" >/dev/null 2>&1 || true
+        log_info "Image pulled and tagged successfully"
+    else
+        log_info "Pulling image from DockerHub: $IMAGE_NAME"
+        docker pull "$IMAGE_NAME"
+        assert $? "Failed to pull image"
+        log_info "Image pulled successfully"
+    fi
 }
 
 # ============================================================================
@@ -577,6 +600,7 @@ show_help() {
     log_info "  remove            - Remove the container"
     log_info "  purge             - Remove the data and media volumes"
     log_info "  pull              - Pull image from DockerHub"
+    log_info "  pull --from-mirror - Pull image via Huawei Cloud mirror"
     if [ "$ENABLE_SSH" = "true" ]; then
         log_info "  sshopen           - Open SSH port (default: 2222, set SSH_PORT to change)"
         log_info "  sshpassword       - Add SSH password to the container"
@@ -629,7 +653,7 @@ main() {
             docker_remove_volume
             ;;
         pull)
-            docker_pull
+            docker_pull "${EXTRA_ARGS[@]}"
             ;;
         sshopen)
             if [ "$ENABLE_START_CMD" = "true" ]; then
