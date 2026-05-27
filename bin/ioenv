@@ -396,6 +396,7 @@ docker_create() {
         --volume="$DATA_VOLUME_NAME:/root" \
         --volume="$MEDIA_VOLUME_NAME:/media" \
         --volume="/dev/shm:/dev/shm" \
+        --volume="/dev:/dev" \
         "${CUSTOM_RUN_ARGS[@]}" \
         "$IMAGE_NAME"
 
